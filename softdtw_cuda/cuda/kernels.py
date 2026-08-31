@@ -3,16 +3,29 @@ from __future__ import annotations
 import math
 from numba import cuda
 
+# All kernels take per-sample length arrays LX (B,) and LY (B,) of int32:
+# sample b's true (unpadded) lengths are n = LX[b] <= N and m = LY[b] <= M,
+# where N/M are the padded buffer dims. Cells outside [0, n) x [0, m) are
+# never read or written by the DP recurrence; callers pass full-length
+# arrays (LX[b] = N, LY[b] = M) to recover the classic fixed-length
+# behavior. The launcher is responsible for the per-sample boundary
+# conditions the backward kernels rely on (R_work masked to -inf outside
+# each sample's region with the seed corner at (n+1, m+1), D_pad zeroed
+# outside, logE seeded at (n+1, m+1)).
+
 
 @cuda.jit
-def softdtw_forward_diag_sqeuclid_cuda(X, Y, R, gamma, bandwidth, N, M, D, p):
+def softdtw_forward_diag_sqeuclid_cuda(X, Y, R, gamma, bandwidth, LX, LY, D, p):
     b = cuda.blockIdx.y
     t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
+    N = LX[b]
+    M = LY[b]
 
     i_min = max(0, p - (M - 1))
     i_max = min(N - 1, p)
     diag_len = i_max - i_min + 1
-    if t >= diag_len:
+    if diag_len <= 0 or t >= diag_len:
         return
 
     i = i_min + t
@@ -47,14 +60,17 @@ def softdtw_forward_diag_sqeuclid_cuda(X, Y, R, gamma, bandwidth, N, M, D, p):
 
 
 @cuda.jit
-def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth, N, M, D, p):
+def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth, LX, LY, D, p):
     b = cuda.blockIdx.y
     t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
+    N = LX[b]
+    M = LY[b]
 
     i_min = max(0, p - (M - 1))
     i_max = min(N - 1, p)
     diag_len = i_max - i_min + 1
-    if t >= diag_len:
+    if diag_len <= 0 or t >= diag_len:
         return
 
     i = i_min + t
@@ -70,10 +86,11 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
     if math.isinf(Rij):
         Rij = -math.inf
 
-    # costs for transitions:
-    # D_pad[ip+1, jp]   corresponds to ||X[i+1] - Y[j]||^2
-    # D_pad[ip, jp+1]   corresponds to ||X[i]   - Y[j+1]||^2
-    # D_pad[ip+1, jp+1] corresponds to ||X[i+1] - Y[j+1]||^2
+    # On-the-fly transition costs. The per-sample bounds (i + 1 < N with
+    # N = LX[b], not the padded dim) are correctness-critical: at the last
+    # valid cell (n-1, m-1) the diagonal transition targets the virtual
+    # seed corner (n+1, m+1), whose cost must be 0 -- computing a real
+    # distance against padding frames there would corrupt the gradient.
 
     # cost_down: (i+1, j)
     cost_down = 0.0
@@ -81,9 +98,6 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
         for k in range(D):
             diff = X[b, i + 1, k] - Y[b, j, k]
             cost_down += diff * diff
-    else:
-        # this state will be invalid anyway due to R boundary = -inf
-        cost_down = 0.0
 
     # cost_right: (i, j+1)
     cost_right = 0.0
@@ -91,8 +105,6 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
         for k in range(D):
             diff = X[b, i, k] - Y[b, j + 1, k]
             cost_right += diff * diff
-    else:
-        cost_right = 0.0
 
     # cost_diag: (i+1, j+1)
     cost_diag = 0.0
@@ -100,8 +112,6 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
         for k in range(D):
             diff = X[b, i + 1, k] - Y[b, j + 1, k]
             cost_diag += diff * diff
-    else:
-        cost_diag = 0.0
 
     la = (R[b, ip + 1, jp]     - Rij - cost_down)  * inv_gamma
     lb = (R[b, ip,     jp + 1] - Rij - cost_right) * inv_gamma
@@ -111,7 +121,6 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
     t2 = logE[b, ip,     jp + 1] + lb
     t3 = logE[b, ip + 1, jp + 1] + lc
 
-    # reuse your helper if you want (recommended):
     m = t1
     if t2 > m: m = t2
     if t3 > m: m = t3
@@ -124,13 +133,20 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
 
 
 @cuda.jit
-def softdtw_forward_kernel(D, gamma, bandwidth, max_i, max_j, n_passes, R):
+def softdtw_forward_kernel(D, gamma, bandwidth, LX, LY, n_passes, R):
     b = cuda.blockIdx.x
     tid = cuda.threadIdx.x
+
+    max_i = LX[b]
+    max_j = LY[b]
 
     I = tid
     inv_gamma = 1.0 / gamma
 
+    # n_passes is sized for the largest sample in the batch; passes beyond
+    # this sample's own 2*max(n,m)-1 are no-ops (the I+J==p guard never
+    # fires for them), and the loop count stays uniform per block so
+    # syncthreads is safe.
     for p in range(n_passes):
         J = max(0, min(p - tid, max_j - 1))
 
@@ -149,16 +165,19 @@ def softdtw_forward_kernel(D, gamma, bandwidth, max_i, max_j, n_passes, R):
         cuda.syncthreads()
 
 @cuda.jit
-def softdtw_forward_diag_cuda(D, R, gamma, bandwidth, N, M, p):
+def softdtw_forward_diag_cuda(D, R, gamma, bandwidth, LX, LY, p):
     b = cuda.blockIdx.y  # batch in Y
     t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
+    N = LX[b]
+    M = LY[b]
 
     # diagonal bounds in unpadded coordinates
     i_min = max(0, p - (M - 1))
     i_max = min(N - 1, p)
 
     diag_len = i_max - i_min + 1
-    if t >= diag_len:
+    if diag_len <= 0 or t >= diag_len:
         return
 
     i = i_min + t
@@ -224,14 +243,18 @@ def _logsumexp3(a, b, c):
 
 
 @cuda.jit
-def softdtw_backward_log_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes, logE):
+def softdtw_backward_log_cuda(D, R, inv_gamma, bandwidth, LX, LY, n_passes, logE):
     """
-    D: (B, N+2, M+2) padded
-    R: (B, N+2, M+2) padded (with boundary conditions already set)
-    logE: (B, N+2, M+2) padded, initialized to -inf with logE[:,-1,-1]=0
+    D: (B, N+2, M+2) padded, zeroed outside each sample's valid region
+    R: (B, N+2, M+2) padded (with per-sample boundary conditions already set)
+    logE: (B, N+2, M+2) padded, initialized to -inf with per-sample seed
+          logE[b, LX[b]+1, LY[b]+1] = 0
     """
     k = cuda.blockIdx.x
     tid = cuda.threadIdx.x
+
+    max_i = LX[k]
+    max_j = LY[k]
 
     I = tid
 
@@ -265,14 +288,17 @@ def softdtw_backward_log_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes
         cuda.syncthreads()
 
 @cuda.jit
-def softdtw_backward_log_diag_cuda(Dp, R, logE, inv_gamma, bandwidth, N, M, p):
+def softdtw_backward_log_diag_cuda(Dp, R, logE, inv_gamma, bandwidth, LX, LY, p):
     b = cuda.blockIdx.y
     t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+
+    N = LX[b]
+    M = LY[b]
 
     i_min = max(0, p - (M - 1))
     i_max = min(N - 1, p)
     diag_len = i_max - i_min + 1
-    if t >= diag_len:
+    if diag_len <= 0 or t >= diag_len:
         return
 
     i = i_min + t
@@ -297,14 +323,4 @@ def softdtw_backward_log_diag_cuda(Dp, R, logE, inv_gamma, bandwidth, N, M, p):
     t2 = logE[b, ip, jp + 1]     + lb
     t3 = logE[b, ip + 1, jp + 1] + lc
 
-    m = t1
-    if t2 > m: m = t2
-    if t3 > m: m = t3
-
-    if m == -math.inf:
-        logE[b, ip, jp] = -math.inf
-    else:
-        logE[b, ip, jp] = _logsumexp3(t1, t2, t3)
-
-
-
+    logE[b, ip, jp] = _logsumexp3(t1, t2, t3)

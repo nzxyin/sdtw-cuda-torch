@@ -13,6 +13,8 @@ def softdtw(
     normalize: bool = False,
     dist: str = "sqeuclidean",
     fused: bool | None = None,
+    lens_x: torch.Tensor | None = None,
+    lens_y: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Convenience functional API.
@@ -20,6 +22,11 @@ def softdtw(
     x: (B,N,D) or (N,D)
     y: (B,M,D) or (M,D)
     fused: None (auto), True (require fused), False (never fused)
+    lens_x/lens_y: optional (B,) int tensors of per-sample true lengths;
+        padding frames beyond them never enter the alignment and get
+        exactly-zero gradients
     returns: (B,)
     """
-    return SoftDTW(gamma=gamma, bandwidth=bandwidth, normalize=normalize, dist=dist, fused=fused)(x, y)
+    return SoftDTW(gamma=gamma, bandwidth=bandwidth, normalize=normalize, dist=dist, fused=fused)(
+        x, y, lens_x=lens_x, lens_y=lens_y
+    )

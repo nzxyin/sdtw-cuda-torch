@@ -19,6 +19,11 @@ class SoftDTW(nn.Module):
         None  -> auto (use fused only when possible)
         True  -> require fused (error if not possible)
         False -> never fused (always materialize D and use D-based autograd)
+
+    Variable-length batches: forward() accepts optional per-sample length
+    tensors lens_x/lens_y of shape (B,). When given, sample b is treated as
+    x[b, :lens_x[b]] vs y[b, :lens_y[b]]; padding frames beyond those
+    lengths never enter the alignment and receive exactly-zero gradients.
     """
 
     def __init__(
@@ -63,7 +68,13 @@ class SoftDTW(nn.Module):
         # auto or forced True
         return fused_ok
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        lens_x: torch.Tensor | None = None,
+        lens_y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Accept (N,D) and (M,D)
         if x.dim() == 2:
             x = x.unsqueeze(0)
@@ -75,13 +86,14 @@ class SoftDTW(nn.Module):
                 f"Expected x,y to have shape (B,N,D) and (B,M,D) (or unbatched (N,D)). "
                 f"Got x={tuple(x.shape)}, y={tuple(y.shape)}"
             )
-        
+
         if self.normalize and x.shape[1] != y.shape[1]:
             raise ValueError(
-                f"normalize=True currently requires equal sequence lengths (N==M) because it uses the "
-                f"concatenation trick. Got N={x.shape[1]}, M={y.shape[1]}."
+                f"normalize=True currently requires equal PADDED sequence lengths (N==M) because it uses "
+                f"the concatenation trick. Got N={x.shape[1]}, M={y.shape[1]}. "
+                f"(Per-sample lens_x/lens_y may still differ.)"
             )
-        
+
         bx, _, dx = x.shape
         by, _, dy = y.shape
         if dx != dy:
@@ -94,6 +106,7 @@ class SoftDTW(nn.Module):
             )
 
         use_fused = self._use_fused(x, y)
+        has_lens = lens_x is not None or lens_y is not None
 
         # ---- Normalization mode ----
         if self.normalize:
@@ -101,18 +114,27 @@ class SoftDTW(nn.Module):
             x_cat = torch.cat([x, x, y], dim=0)
             y_cat = torch.cat([y, x, y], dim=0)
 
+            if has_lens:
+                lx = lens_x if lens_x is not None else torch.full((bx,), x.shape[1], dtype=torch.int64, device=x.device)
+                ly = lens_y if lens_y is not None else torch.full((by,), y.shape[1], dtype=torch.int64, device=y.device)
+                lx_cat = torch.cat([lx, lx, ly], dim=0)
+                ly_cat = torch.cat([ly, lx, ly], dim=0)
+            else:
+                lx_cat = None
+                ly_cat = None
+
             if use_fused:
-                out = SoftDTWXYAutograd.apply(x_cat, y_cat, self.gamma, self.bandwidth)
+                out = SoftDTWXYAutograd.apply(x_cat, y_cat, self.gamma, self.bandwidth, lx_cat, ly_cat)
             else:
                 D = pairwise_distance(x_cat, y_cat, dist=self.dist)
-                out = SoftDTWAutograd.apply(D, self.gamma, self.bandwidth)
+                out = SoftDTWAutograd.apply(D, self.gamma, self.bandwidth, lx_cat, ly_cat)
 
             out_xy, out_xx, out_yy = out.split(bx, dim=0)
             return out_xy - 0.5 * (out_xx + out_yy)
 
         # ---- Non-normalized ----
         if use_fused:
-            return SoftDTWXYAutograd.apply(x, y, self.gamma, self.bandwidth)
+            return SoftDTWXYAutograd.apply(x, y, self.gamma, self.bandwidth, lens_x, lens_y)
 
         D_xy = pairwise_distance(x, y, dist=self.dist)
-        return SoftDTWAutograd.apply(D_xy, self.gamma, self.bandwidth)
+        return SoftDTWAutograd.apply(D_xy, self.gamma, self.bandwidth, lens_x, lens_y)

@@ -125,6 +125,34 @@ loss.backward()
 * Best choice for large `N`, `D`
 
 ---
+
+### Variable-Length Batches (Padding Support)
+
+Real batches rarely share one sequence length. Pass per-sample lengths and
+padding frames never enter the alignment — the DP recurrence stops at each
+sample's own true length, per-sample results are read from each sample's own
+final DP cell, and **padding frames receive exactly-zero gradients**:
+
+```python
+loss_fn = SoftDTW(gamma=1.0)
+
+x = torch.randn(B, N, D, device="cuda", requires_grad=True)  # padded
+y = torch.randn(B, M, D, device="cuda")                      # padded
+lens_x = torch.tensor([...])  # (B,) true lengths, 1 <= lens_x[b] <= N
+lens_y = torch.tensor([...])  # (B,) true lengths, 1 <= lens_y[b] <= M
+
+loss = loss_fn(x, y, lens_x=lens_x, lens_y=lens_y).mean()
+loss.backward()
+```
+
+* Works in every mode: fused / unfused, CUDA / CPU, `normalize=True` / `False`
+* Equivalent to (but much faster than) a Python loop of per-sample sliced
+  batch-1 calls — batch parallelism is preserved on the GPU
+* With `normalize=True`, the padded dims must still match (`N == M`), but
+  per-sample `lens_x[b]`/`lens_y[b]` may differ
+* Omitting the lengths keeps the classic fixed-length behavior
+
+---
 # Applications
 ## Forecasting
 
