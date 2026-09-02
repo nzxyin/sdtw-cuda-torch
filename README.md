@@ -81,7 +81,7 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 
 | Component | Validated | Expected to work | Not recommended |
 |---|---|---|---|
-| Python | *(cluster default, not independently pinned)* | up to **3.14** (latest stable — Numba 0.67.0 and PyTorch 2.14.0 both declare 3.14 support) | — |
+| Python | **3.13.9** | up to **3.14** (latest stable — Numba 0.67.0 and PyTorch 2.14.0 both declare 3.14 support) | — |
 | Numba | **0.65.1** | up to ~0.65.x | **≥ 0.66**, including **0.67.0** (current latest) — see note below |
 | PyTorch | **2.13.0+cu130** | up to **2.14.0** (released 2026-09-02) | — |
 | CUDA Toolkit | **13.0** | 13.1 – 13.3 (per `numba-cuda`'s "current + previous major toolkit" support window) | CUDA ≤ 12.x (no longer tested against this fork) |
@@ -89,7 +89,10 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 **Validated** = actually run end-to-end on this fork (2026-08-31, real L40S/Ada GPUs, SLURM
 jobs completed with exit code 0): forward and backward passes in both fused and unfused modes,
 a CUDA-vs-CPU numerical cross-check, a 2-GPU lazy-CUDA-context-binding scenario, and the full
-40-test pytest suite (including the `lens_x`/`lens_y` variable-length-batch tests below).
+40-test pytest suite (including the `lens_x`/`lens_y` variable-length-batch tests below), run
+with Python 3.13.9. The "expected to work" cells are also being re-validated by actually running
+this repo's pytest suite against each combination (not just citing upstream release notes) — see
+[#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2) for results as they land.
 
 **Why Numba 0.67.0 is flagged "not recommended" despite being the current latest release:**
 the CUDA kernels here depend on [`numba-cuda`](https://github.com/NVIDIA/numba-cuda), the
@@ -99,6 +102,18 @@ repo has had no commits since 2026-07-06 — before Numba 0.67.0 shipped (2026-0
 minor bumps (e.g. 0.66) each needed an explicit `numba-cuda` compatibility patch, so pairing
 Numba 0.67.0 with the current `numba-cuda` release is unverified upstream. Re-validate before
 relying on it.
+
+**Longer-term successor to watch:** NVIDIA is actively developing
+[`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir) (commits as recent as today,
+PyPI releases roughly every 2-3 weeks) as the forward path for `numba-cuda`, which is now in
+maintenance mode. Notably, `numba-cuda-mlir` does **not** depend on `numba`/`numba-cuda` at
+all — it's an independent MLIR-based compiler that aims for source-level compatibility with
+existing `numba.cuda` kernels, so it sidesteps the "needs a patch per Numba minor version"
+fragility described above entirely. Adopting it isn't a drop-in swap, though: it requires
+changing `from numba import cuda` to `from numba_cuda_mlir import cuda` throughout
+`softdtw_cuda/cuda/`, and it needs **Python ≥ 3.11** (higher than this repo's current ≥3.10
+floor). This fork has not migrated to it — noted here as a real, actively-maintained option
+worth evaluating rather than something already adopted.
 
 > ⚠️ Compatibility beyond the validated combination above is not guaranteed. PyPI PyTorch
 > wheels newer than `cu130` (e.g. `cu132`) may also be less mature than `cu130`.
