@@ -1,5 +1,9 @@
 # SoftDTW-CUDA (PyTorch + Numba)
 
+[![Tests](https://github.com/nzxyin/sdtw-cuda-torch/actions/workflows/test.yml/badge.svg)](https://github.com/nzxyin/sdtw-cuda-torch/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
 > This is a fork of [BGU-CS-VIL/sdtw-cuda-torch](https://github.com/BGU-CS-VIL/sdtw-cuda-torch)
 > maintained by [@nzxyin](https://github.com/nzxyin). Changes from upstream: **variable-length
 > padded batch support** (`lens_x`/`lens_y`) for real-world training data such as spectrograms
