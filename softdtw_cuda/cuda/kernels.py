@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from numba import cuda
+from numba_cuda_mlir import cuda
 
 # All kernels take per-sample length arrays LX (B,) and LY (B,) of int32:
 # sample b's true (unpadded) lengths are n = LX[b] <= N and m = LY[b] <= M,
