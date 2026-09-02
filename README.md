@@ -71,11 +71,12 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 * NVIDIA GPU with CUDA Toolkit 13.x — compute capability ≥ 7.5 (Turing or newer; CUDA 13
   dropped Maxwell/Pascal/Volta support), driver ≥ 580 (≥ 595.45.04 for CUDA 13.2+ on Linux)
 * PyTorch with CUDA support (see below)
-* Numba ≥ 0.60 — this package's kernels use `numba.cuda`. Since Numba ~0.61 the CUDA target
-  has lived in the separate [`numba-cuda`](https://github.com/NVIDIA/numba-cuda) package,
-  which this repo currently relies on implicitly rather than declaring as a dependency
-  ([#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2)); `numba-cuda` is in maintenance
-  mode as of CUDA 13, so very new Numba releases should be spot-checked before use
+* Numba ≥ 0.60, **but not ≥ 0.66 as of this writing** — this package's kernels use
+  `numba.cuda`, and Numba ≥ 0.66 is confirmed broken for this repo via every path tried so far
+  (in-tree target and `numba-cuda 0.30.4` both fail on real GPU test runs, for three different
+  reasons — see the Compatibility Matrix below and [#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2)).
+  `numba-cuda-mlir` is a confirmed-working alternative but requires a small code change this fork
+  hasn't made yet (also detailed below)
 
 ### Compatibility Matrix
 
@@ -90,36 +91,56 @@ exactly one thing from the validated baseline (Numba 0.65.1 / Python 3.13.9 / Py
 | Python → **3.14** (latest stable) | ✅ **40 passed, 5 skipped** | 2026-09-02, job 10291991 |
 | PyTorch → **2.14.0+cu130** (released 2026-09-02) | ✅ **40 passed, 5 skipped** | job 10291991 |
 | PyTorch → **2.14.0+cu132** (CUDA 13.2 wheel) | ✅ **40 passed, 5 skipped** | job 10291991 |
-| Numba → **0.67.0** (current latest) | ❌ **19 failed, 21 passed, 5 skipped** | job 10291991 — see root cause below |
-| Everything above at once (Numba 0.67.0 + Python 3.14 + PyTorch 2.14.0+cu132) | ❌ **19 failed, 21 passed, 5 skipped** — identical failure set to the Numba-alone row | job 10291991 — confirms Numba 0.67.0 is the sole cause, not Python or PyTorch |
+| Numba → **0.67.0** (current latest), in-tree CUDA target | ❌ **19 failed, 21 passed, 5 skipped** | job 10291991 — root cause 1 below |
+| Everything above at once (Numba 0.67.0 + Python 3.14 + PyTorch 2.14.0+cu132) | ❌ **19 failed, 21 passed, 5 skipped** — identical failure set to the Numba-alone row | job 10291991 — confirms Numba 0.67.0's in-tree target is the sole cause, not Python or PyTorch |
+| Numba 0.67.0 + `numba-cuda==0.30.4` (explicit out-of-tree package) | ❌ **19 failed** (different error) | job 10292057 — root cause 2 below |
+| Numba 0.67.0 + `numba-cuda==0.30.4` + `numpy<2.5` | ❌ **19 failed** (yet another different error) | job 10292066 — root cause 3 below |
+| Numba 0.67.0 (core, CPU path only) + **`numba-cuda-mlir==0.5.1`** (CUDA target) | ✅ **40 passed, 5 skipped** | job 10292092 — see "Working path for Numba 0.67.0" below |
 
-**Root cause of the Numba 0.67.0 failures (confirmed, not speculative):** every failure is the
-same `TypeError: Signature mismatch: 2 argument types given, but function takes 1 arguments`,
-and every failing test exercises a CUDA kernel — CPU-path tests all pass. This repo's kernels
-(`softdtw_cuda/cuda/kernels.py`) call two-argument `max()`/`min()` extensively (e.g. `max(0, p -
-(M - 1))`, `min(N - 1, p)`), which is exactly the pattern broken by
-[numba/numba#10753](https://github.com/numba/numba/issues/10753) — an **open upstream
-regression**, introduced in Numba 0.66.0 (PR #10543 refactored `max`/`min` into `*args`
-overloads) and still present in 0.67.0, affecting Numba's own in-tree CUDA target specifically
-(the CPU target and `numba-cuda`, the out-of-tree package, are both unaffected — see the
-maintainer's comment on that issue). This repo currently relies on the in-tree target implicitly
-(no `numba-cuda` dependency declared — [#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2)),
-which is precisely why it hits this bug. **Do not use Numba ≥ 0.66 without also installing
-`numba-cuda`** until this is confirmed fixed or upstream resolves it.
+**Three independent, confirmed root causes make Numba ≥ 0.66's usual CUDA paths fail today** —
+each isolated by actually changing one variable and rerunning the suite, not inferred:
 
-**Longer-term successor to watch:** NVIDIA is actively developing
-[`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir) (commits as recent as today,
-PyPI releases roughly every 2-3 weeks) as the forward path for `numba-cuda`, which is now in
-maintenance mode. Notably, `numba-cuda-mlir` does **not** depend on `numba`/`numba-cuda` at
-all — it's an independent MLIR-based compiler that aims for source-level compatibility with
-existing `numba.cuda` kernels, so it sidesteps the "needs a patch per Numba minor version"
-fragility described above entirely. Adopting it isn't a drop-in swap, though: it requires
-changing `from numba import cuda` to `from numba_cuda_mlir import cuda` throughout
-`softdtw_cuda/cuda/`, and it needs **Python ≥ 3.11** (higher than this repo's current ≥3.10
-floor). This fork has not migrated to it — noted here as a real, actively-maintained option
-worth evaluating rather than something already adopted.
+1. **In-tree target (no `numba-cuda` installed):** every failure is `TypeError: Signature
+   mismatch: 2 argument types given, but function takes 1 arguments`, and only CUDA-path tests
+   fail — CPU-path tests all pass. This repo's kernels (`softdtw_cuda/cuda/kernels.py`) call
+   two-argument `max()`/`min()` extensively (e.g. `max(0, p - (M - 1))`, `min(N - 1, p)`), which
+   is exactly the pattern broken by [numba/numba#10753](https://github.com/numba/numba/issues/10753)
+   — an **open upstream regression** introduced in Numba 0.66.0 (PR #10543 refactored `max`/`min`
+   into `*args` overloads), affecting only the in-tree CUDA target.
+2. **`numba-cuda==0.30.4` installed (the fix for #1):** avoids the max/min bug, but every test
+   now fails with `AttributeError: module 'numpy' has no attribute 'row_stack'`, raised from
+   inside `numba-cuda` itself at CUDA-target registry-load time. NumPy fully removed `row_stack`
+   in 2.5 (which `uv` resolves by default alongside Numba 0.67.0); `numba-cuda` 0.30.4 hasn't
+   caught up — tracked as [NVIDIA/numba-cuda#907](https://github.com/NVIDIA/numba-cuda/issues/907)
+   (open since 2026-07-03, with an unmerged one-line patch).
+3. **`numba-cuda==0.30.4` + `numpy<2.5` (routing around #2):** gets past module load into actual
+   kernel compilation, then fails with `RuntimeError: Missing libdevice file` — `numba-cuda`'s own
+   CUDA-toolkit pathfinder can't locate `libdevice.10.bc` in an environment that only has PyTorch's
+   bundled NVRTC wheel. Not yet resolved (an explicit `cuda-nvcc`/libdevice-providing package might
+   fix it, but wasn't tested — see [#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2)).
 
-> ⚠️ Compatibility beyond the validated combination above is not guaranteed. PyPI PyTorch
+**As of today, there is no known way to get Numba 0.67.0 working via either the in-tree target or
+`numba-cuda` for this repo.** Do not upgrade past Numba 0.65.x on either path.
+
+**Working path for Numba 0.67.0: `numba-cuda-mlir`, empirically verified.**
+[`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir) is NVIDIA's actively-developed
+successor to `numba-cuda` (commits as recent as today, PyPI releases every 2-3 weeks) — an
+independent MLIR-based compiler with **no dependency on `numba`/`numba-cuda` at all**, so it
+sidesteps all three bugs above. Verified by patching a scratch copy of this repo (changing just
+`from numba import cuda` to `from numba_cuda_mlir import cuda` in `kernels.py` and `launcher.py`
+— `launcher.py`'s unrelated `from numba import jit, prange` CPU path stays as plain `numba`) and
+running the real test suite: **40 passed, 5 skipped**, with Numba 0.67.0 (core), `numba-cuda-mlir`
+0.5.1, NumPy 2.5.2, and PyTorch 2.13.0+cu130 (job 10292092) — the only combination in this whole
+investigation that gets Numba 0.67.0 working end-to-end. Not yet adopted by this repo — doing so
+would mean:
+* Bumping this repo's Python floor from `>=3.10` to `>=3.11` (`numba-cuda-mlir`'s own requirement)
+* Adding `numba-cuda-mlir` as an explicit dependency (keeping `numba` core for the CPU-only path)
+* A more verbose `NumbaPerformanceWarning` on small-grid kernel launches than plain `numba.cuda`
+  emits at the same sizes (cosmetic, not a correctness issue)
+
+Full details and reproduction commands: [#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2).
+
+> ⚠️ Compatibility beyond the validated combinations above is not guaranteed. PyPI PyTorch
 > wheels newer than `cu130` (e.g. `cu132`) may also be less mature than `cu130`.
 
 ### Step 1 — Install PyTorch with CUDA
