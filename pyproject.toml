@@ -19,12 +19,13 @@ classifiers = [
 dependencies = [
     "numba>=0.60",
     "numba-cuda-mlir>=0.5",
-    "numpy>=1.24",
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
 cu12 = ["numba-cuda-mlir[cu12]"]
 cu13 = ["numba-cuda-mlir[cu13]"]
+test = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/nzxyin/sdtw-cuda-torch"
