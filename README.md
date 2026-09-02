@@ -1,5 +1,18 @@
 # SoftDTW-CUDA (PyTorch + Numba)
 
+[![Tests](https://github.com/nzxyin/sdtw-cuda-torch/actions/workflows/test.yml/badge.svg)](https://github.com/nzxyin/sdtw-cuda-torch/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
+> This is a fork of [BGU-CS-VIL/sdtw-cuda-torch](https://github.com/BGU-CS-VIL/sdtw-cuda-torch)
+> maintained by [@nzxyin](https://github.com/nzxyin). Changes from upstream: **variable-length
+> padded batch support** (`lens_x`/`lens_y`) for real-world training data such as spectrograms
+> (see [Variable-Length Sequences](#variable-length-sequences-spectrograms-asrtts)), and a CUDA
+> backend migration from `numba.cuda`/`numba-cuda` to
+> [`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir), because plain `numba.cuda`
+> breaks on Numba 0.66+ for this repo's kernels. Validated on Python 3.11 through 3.14, see the
+> [Compatibility Matrix](#compatibility-matrix).
+
 A **GPU-accelerated, memory-efficient, and numerically stable** implementation of
 **Soft Dynamic Time Warping (SoftDTW)** for PyTorch.
 
@@ -9,6 +22,7 @@ This package is designed primarily as a **loss function for training neural netw
 * 📏 **Long sequence support** (lengths > 1024)
 * 🧮 **Numerical stability** (log-space backward)
 * ⚡ **Optional fused distance computation** (no `(B,N,M)` tensor)
+* 🧩 **Variable-length padded batches** (per-sample `lens_x`/`lens_y`, exact-zero padding gradients)
 * 📊 **Time series averaging** (SoftDTW barycenters)
 
 ---
@@ -25,6 +39,7 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 | CUDA backward | ⚠️ numerically unstable | ✅ log-space stable |
 | Max sequence length | ❌ ≤ 1024 | ✅ unbounded (tiled) |
 | Memory-efficient fused mode | ❌ | ✅ |
+| Variable-length padded batches | ❌ (fixed length only) | ✅ per-sample `lens_x`/`lens_y` |
 
 ### Key Benchmark (B=32, N=512, D=64)
 
@@ -32,8 +47,8 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 |---|---|---|---|
 | **Peak Memory** | 8,256 MB | 257 MB | 161 MB |
 | **Runtime** | 2,791 ms | **42 ms** | 430 ms |
-| **vs. Maghoumi memory** | — | 96.9% less | 98.0% less |
-| **vs. Maghoumi speed** | — | **67× faster** | 6.5× faster |
+| **vs. Maghoumi memory** | N/A | 96.9% less | 98.0% less |
+| **vs. Maghoumi speed** | N/A | **67× faster** | 6.5× faster |
 
 ### When to Use Each Mode
 
@@ -58,27 +73,76 @@ Compared to the popular CUDA implementation by [Maghoumi et al.](https://github.
 
 ### Requirements
 
-* Python ≥ 3.10
-* NVIDIA GPU with CUDA toolkit **≤ 12.6**
+* Python 3.11+
+* NVIDIA GPU, Compute Capability 7.0+ (Volta or newer), with a matching driver
 * PyTorch with CUDA support (see below)
-* Numba ≥ 0.60
+* Numba 0.60+ for the CPU fallback path only. CUDA kernels use
+  [`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir) instead of `numba.cuda`; see
+  its [own requirements](https://github.com/NVIDIA/numba-cuda-mlir#installation-requirements)
+  for full driver and toolkit details, and the Compatibility Matrix below for why.
 
-> ⚠️ Tested with CUDA ≤ 12.6. Compatibility with newer CUDA versions is not guaranteed.
+### Compatibility Matrix
 
-### Step 1 — Install PyTorch with CUDA
+This fork's CUDA kernels use [`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir)
+instead of `numba.cuda`/`numba-cuda` (see "Why `numba-cuda-mlir`?" below). Plain `numba` is
+still a dependency, used only for the CPU fallback path. Every row below was run through this
+repo's own 45-item pytest suite on a real GPU, not inferred from release notes or vendor claims.
 
-PyTorch must be installed **before** this package, with the correct CUDA variant for your system. See [pytorch.org/get-started](https://pytorch.org/get-started/locally/) for the right command. Example for CUDA 12.4:
+Each Python version is paired with the current latest Numba and PyTorch release, confirmed via
+each project's own wheel index to actually have a build for that Python version:
+
+| Python | Numba | PyTorch | numba-cuda-mlir | Result |
+|---|---|---|---|---|
+| **3.11** | 0.67.0 | 2.14.0+cu130 | 0.5.1 | 40 passed, 5 skipped |
+| **3.12** | 0.67.0 | 2.14.0+cu130 | 0.5.1 | 40 passed, 5 skipped |
+| **3.13** | 0.67.0 | 2.14.0+cu130 | 0.5.1 | 40 passed, 5 skipped |
+| **3.14** | 0.67.0 | 2.14.0+cu130 | 0.5.1 | 40 passed, 5 skipped |
+
+Python 3.10 is no longer supported (`numba-cuda-mlir` requires 3.11+). PyTorch 2.14.0's `cu132`
+build (CUDA 13.2) also passes the full suite.
+
+Also validated, from before the `numba-cuda-mlir` migration: Numba 0.65.1 with the old
+`numba.cuda` in-tree target, Python 3.13, PyTorch 2.13.0+cu130, CUDA 13.0: 40/40 passed.
+
+Compatibility beyond the combinations above is not guaranteed.
+
+### Why `numba-cuda-mlir`?
+
+This fork originally used `numba.cuda` directly. Testing Numba 0.67.0 (the latest release)
+surfaced three separate upstream bugs that break this repo's kernels on Numba 0.66+:
+
+1. The in-tree CUDA target hits [numba/numba#10753](https://github.com/numba/numba/issues/10753),
+   an open regression in two-argument `max()`/`min()`, which this repo's kernels use throughout.
+2. Installing `numba-cuda` (the usual fix) instead hits
+   [NVIDIA/numba-cuda#907](https://github.com/NVIDIA/numba-cuda/issues/907): it still
+   references `np.row_stack`, removed in NumPy 2.5.
+3. Working around that with `numpy<2.5` then fails on a missing `libdevice` file, which
+   `numba-cuda`'s pathfinder cannot locate in this setup.
+
+`numba-cuda-mlir` avoids all three: it does not depend on `numba` or `numba-cuda` at all. The
+migration was two import lines (`from numba import cuda` to `from numba_cuda_mlir import
+cuda`), a Python floor bump to 3.11, and a new dependency. Full details on
+[#2](https://github.com/nzxyin/sdtw-cuda-torch/issues/2).
+
+### Step 1: Install PyTorch with CUDA
+
+PyTorch must be installed **before** this package, with the correct CUDA variant for your system. See [pytorch.org/get-started](https://pytorch.org/get-started/locally/) for the right command. Example for CUDA 13.0 (the combination validated for this fork):
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install torch --index-url https://download.pytorch.org/whl/cu130
 ```
 
 
-### Step 2 — Install this package
+### Step 2: Install this package with the matching CUDA extra
+
+This package's CUDA kernels depend on
+[`numba-cuda-mlir`](https://github.com/NVIDIA/numba-cuda-mlir), which needs to know whether to
+pull CUDA 12.x or 13.x toolkit components. Pick the extra matching the CUDA variant you
+installed PyTorch with in Step 1:
 
 ```bash
-git clone https://github.com/BGU-CS-VIL/sdtw-cuda-torch
-pip install -e sdtw-cuda-torch
+git clone https://github.com/nzxyin/sdtw-cuda-torch
+pip install -e "sdtw-cuda-torch[cu13]"   # or "[cu12]" for CUDA 12.x
 ```
 
 ---
@@ -129,7 +193,7 @@ loss.backward()
 ### Variable-Length Batches (Padding Support)
 
 Real batches rarely share one sequence length. Pass per-sample lengths and
-padding frames never enter the alignment — the DP recurrence stops at each
+padding frames never enter the alignment: the DP recurrence stops at each
 sample's own true length, per-sample results are read from each sample's own
 final DP cell, and **padding frames receive exactly-zero gradients**:
 
@@ -147,7 +211,7 @@ loss.backward()
 
 * Works in every mode: fused / unfused, CUDA / CPU, `normalize=True` / `False`
 * Equivalent to (but much faster than) a Python loop of per-sample sliced
-  batch-1 calls — batch parallelism is preserved on the GPU
+  batch-1 calls; batch parallelism is preserved on the GPU
 * With `normalize=True`, the padded dims must still match (`N == M`), but
   per-sample `lens_x[b]`/`lens_y[b]` may differ
 * Omitting the lengths keeps the classic fixed-length behavior
@@ -156,7 +220,7 @@ loss.backward()
 # Applications
 ## Forecasting
 
-![Forecasting](https://github.com/BGU-CS-VIL/sdtw-cuda-torch/blob/main/examples/forecasting_results.png)
+![Forecasting](https://github.com/nzxyin/sdtw-cuda-torch/blob/main/examples/forecasting_results.png)
 Train a simple forecaster using SoftDTW as the loss function:
 
 ```python
@@ -180,8 +244,37 @@ See [examples/forecasting_example.py](examples/forecasting_example.py) for a com
 
 
 
+## Variable-Length Sequences (Spectrograms, ASR/TTS)
+
+Speech and audio batches almost never share one frame count. Spectrograms,
+mel-features, and other frame-rate time series have a different true length
+per utterance and get zero-padded to the batch's longest sample. Pass
+`lens_x`/`lens_y` so the padding never enters the alignment or the gradient,
+which keeps the batched call numerically identical to looping over unpadded
+per-sample calls:
+
+```python
+from softdtw_cuda import SoftDTW
+
+model = MySpectrogramModel().cuda()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = SoftDTW(gamma=0.5, fused=True)
+
+for specs, targets, lengths in dataloader:  # specs/targets: (B, T_max, n_mels), padded
+    pred = model(specs.cuda())              # (B, T_max, n_mels)
+    loss = loss_fn(pred, targets.cuda(), lens_x=lengths.cuda(), lens_y=lengths.cuda()).mean()
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+See [examples/variable_length_spectrogram_example.py](examples/variable_length_spectrogram_example.py) for a complete working example that trains a denoiser on synthetic variable-length spectrograms and verifies the padded-batch loss exactly matches a per-sample loop.
+
+
+
 ## Time Series Barycenters (Averaging)
-![SoftDTW Barycenter](https://github.com/BGU-CS-VIL/sdtw-cuda-torch/blob/main/examples/softdtw_barycenter_example.png)
+![SoftDTW Barycenter](https://github.com/nzxyin/sdtw-cuda-torch/blob/main/examples/softdtw_barycenter_example.png)
 
 Compute a DTW-space average (barycenter) for a batch of sequences:
 
@@ -252,6 +345,7 @@ pytest -v
 | `test_fused_sqeuclid.py` | Fused vs unfused equivalence for squared Euclidean |
 | `test_sqeuclidean.py` | Distance computation correctness |
 | `test_validation.py` | Input validation: gamma, device, empty sequences, shape mismatches |
+| `test_lengths.py` | Variable-length padded batches (`lens_x`/`lens_y`): batched-vs-per-sample equivalence, exact-zero padding gradients, tiled-path lengths, gradcheck |
 
 ---
 
@@ -287,9 +381,9 @@ python examples/barycenter_example.py --compare
 > Based on [tslearn](https://github.com/tslearn-team/tslearn) implementation, originally from Cuturi & Blondel (ICML 2017)
 
 **Prior PyTorch/CUDA implementations this work builds on:**
-* [Sleepwalking/pytorch-softdtw](https://github.com/Sleepwalking/pytorch-softdtw) — PyTorch GPU implementation
-* [Maghoumi/pytorch-softdtw-cuda](https://github.com/Maghoumi/pytorch-softdtw-cuda) — CUDA implementation (motivation for memory and stability improvements)
-* [keonlee9420/Soft-DTW-Loss](https://github.com/keonlee9420/Soft-DTW-Loss) — additional PyTorch reference implementation
+* [Sleepwalking/pytorch-softdtw](https://github.com/Sleepwalking/pytorch-softdtw): PyTorch GPU implementation
+* [Maghoumi/pytorch-softdtw-cuda](https://github.com/Maghoumi/pytorch-softdtw-cuda): CUDA implementation (motivation for memory and stability improvements)
+* [keonlee9420/Soft-DTW-Loss](https://github.com/keonlee9420/Soft-DTW-Loss): additional PyTorch reference implementation
 
 ---
 

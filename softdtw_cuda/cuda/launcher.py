@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import numpy as np
 import torch
-from numba import cuda
+from numba_cuda_mlir import cuda
 from numba import jit, prange
 
 from .kernels import softdtw_forward_kernel, softdtw_forward_diag_cuda
