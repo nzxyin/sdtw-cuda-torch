@@ -22,8 +22,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/BGU-CS-VIL/sdtw-cuda-torch"
-Repository = "https://github.com/BGU-CS-VIL/sdtw-cuda-torch"
+Homepage = "https://github.com/nzxyin/sdtw-cuda-torch"
+Repository = "https://github.com/nzxyin/sdtw-cuda-torch"
 
 [tool.setuptools.packages.find]
 where = ["."]
