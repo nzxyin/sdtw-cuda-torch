@@ -79,12 +79,16 @@ def softdtw_backward_log_diag_sqeuclid_cuda(X, Y, R, logE, inv_gamma, bandwidth,
     ip = i + 1
     jp = j + 1
 
+    # Demote unreachable / out-of-band cells (R == +inf) to -inf *before* the
+    # bandwidth prune, so that in-band neighbours reading them contribute
+    # exp(-inf)=0 instead of producing (-inf)+(+inf)=NaN in the log-space sum.
+    if math.isinf(R[b, ip, jp]):
+        R[b, ip, jp] = -math.inf
+
     if bandwidth > 0 and abs(i - j) > bandwidth:
         return
 
     Rij = R[b, ip, jp]
-    if math.isinf(Rij):
-        Rij = -math.inf
 
     # On-the-fly transition costs. The per-sample bounds (i + 1 < N with
     # N = LX[b], not the padded dim) are correctness-critical: at the last
@@ -267,12 +271,16 @@ def softdtw_backward_log_cuda(D, R, inv_gamma, bandwidth, LX, LY, n_passes, logE
 
         if I + J == rev_p and (I < max_i and J < max_j):
 
+            # Demote unreachable / out-of-band cells (R == +inf) to -inf *before*
+            # the bandwidth prune, so in-band neighbours reading them contribute
+            # exp(-inf)=0 rather than (-inf)+(+inf)=NaN in the log-space sum.
+            if math.isinf(R[k, i, j]):
+                R[k, i, j] = -math.inf
+
             # pruning
             if not (abs(i - j) > bandwidth > 0):
 
                 Rij = R[k, i, j]
-                if math.isinf(Rij):
-                    Rij = -math.inf
 
                 # log transition weights (no exp here!)
                 la = (R[k, i + 1, j]     - Rij - D[k, i + 1, j])     * inv_gamma
@@ -307,13 +315,17 @@ def softdtw_backward_log_diag_cuda(Dp, R, logE, inv_gamma, bandwidth, LX, LY, p)
     ip = i + 1
     jp = j + 1
 
+    # Demote unreachable / out-of-band cells (R == +inf) to -inf *before* the
+    # bandwidth prune (see softdtw_backward_log_cuda) to avoid (-inf)+(+inf)=NaN
+    # in the log-space accumulation of in-band neighbours.
+    if math.isinf(R[b, ip, jp]):
+        R[b, ip, jp] = -math.inf
+
     # pruning
     if bandwidth > 0 and abs(i - j) > bandwidth:
         return
 
     Rij = R[b, ip, jp]
-    if math.isinf(Rij):
-        Rij = -math.inf
 
     la = (R[b, ip + 1, jp]     - Rij - Dp[b, ip + 1, jp])     * inv_gamma
     lb = (R[b, ip, jp + 1]     - Rij - Dp[b, ip, jp + 1])     * inv_gamma
