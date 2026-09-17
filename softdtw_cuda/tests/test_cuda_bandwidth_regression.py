@@ -1,11 +1,12 @@
 """Regression tests for the Sakoe-Chiba bandwidth NaN bug in the CUDA backward.
 
-Before the fix, all CUDA backward kernels (fast, tiled, and fused) produced NaN
+Before the fix, *all* CUDA backward kernels (fast, tiled, and fused) produced NaN
 gradients whenever a bandwidth was active: out-of-band cells were not demoted to
 -inf before in-band neighbours read them, yielding (-inf)+(+inf)=NaN in the
-log-space accumulation. The CPU reference was already correct. These tests
-assert the CUDA gradients are finite and match the CPU reference under a
-bandwidth, for both the fused and unfused paths.
+log-space accumulation. The CPU reference was already correct, and CI is
+CPU-only, so this never surfaced there. These tests assert the CUDA gradients
+are finite and match the CPU reference under a bandwidth, for both the fused
+and unfused paths.
 """
 from __future__ import annotations
 
