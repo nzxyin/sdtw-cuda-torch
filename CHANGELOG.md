@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+- Extended `lens_x`/`lens_y` per-sample variable-length batching to the exact-DTW path (`DTW`
+  module, functional `dtw()`), closing the gap called out in `0.3.0` below. See issue #6.
+  - `dtw_forward_diag_stream_sqeuclid_cuda` (the fused streaming kernel) now captures each
+    sample's terminal DP cell into a dedicated `out` (B,) array the instant it's computed,
+    since its three rotating anti-diagonal buffers are reused every 3 diagonals and can't be
+    read back after the sweep moves past a short sample. The whole-batch `N>M` buffer-axis swap
+    is unchanged; `lens_x`/`lens_y` swap alongside `X`/`Y` so they keep naming the lengths of
+    whichever tensor the swap put on the buffer axis.
+  - The D-based (`dtw_forward_cuda`) and CPU (`dtw_forward_cpu`) paths needed no kernel/numba
+    changes at all: their DP tables are written once per cell and only ever read
+    strictly-smaller-index predecessors, so a sample's terminal cell is already computed purely
+    from real (non-padding) costs regardless of what padding elsewhere produces. Per-sample
+    lengths are handled entirely in the launcher, by validating `lens_x`/`lens_y` and reading
+    each sample's own final cell instead of the fixed corner.
+  - Added `softdtw_cuda/tests/test_dtw_lengths.py`: batched-vs-per-sample-sliced equivalence,
+    the `N>M` swap combined with unequal per-sample lengths, three-way fused/unfused/CPU
+    agreement, bandwidth + lengths together, and long sequences.
+  - `dtw_barycenter` (classic DBA) is explicitly out of scope for this change — it doesn't use
+    these CUDA kernels at all (its DP/backtrack is a separate numba CPU loop) and has different
+    bandwidth semantics; tracked separately as issue #8.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added

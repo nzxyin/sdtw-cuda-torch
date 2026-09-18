@@ -60,7 +60,7 @@ def softdtw_forward_diag_sqeuclid_cuda(X, Y, R, gamma, bandwidth, LX, LY, D, p):
 
 
 @cuda.jit
-def dtw_forward_diag_stream_sqeuclid_cuda(X, Y, prev2, prev1, curr, bandwidth, N, M, D, p):
+def dtw_forward_diag_stream_sqeuclid_cuda(X, Y, prev2, prev1, curr, bandwidth, N, M, LX, LY, out, D, p):
     """Fused *hard* DTW forward, streaming: one anti-diagonal per launch over
     three rotating 1-D buffers -> O(min(N, M)) memory (no (N, M) DP table).
 
@@ -71,10 +71,14 @@ def dtw_forward_diag_stream_sqeuclid_cuda(X, Y, prev2, prev1, curr, bandwidth, N
     ``N <= M`` via ``DTW(x, y) == DTW(y, x)``). The aggregation is a true
     ``min`` and there is no gamma. Forward-only, so there is no backward kernel.
 
-    Forward-only and not yet per-sample-length aware (unlike the SoftDTW
-    kernels above): N/M are whole-batch scalars, not LX/LY arrays. DTW's
-    module wrapper doesn't accept lens_x/lens_y either -- see the tracking
-    issue for extending variable-length support to this path.
+    Per-sample lengths (LX/LY, whole-batch padded N/M still bound the sweep
+    and buffer indexing): each rotating buffer slot is reused every 3
+    diagonals, so a short sample's terminal cell can't simply be read back
+    from the buffers once the sweep moves past it -- it's captured into
+    ``out`` (B,) the instant it's computed instead. ``out`` must be
+    pre-filled with +inf by the host: a terminal cell pruned by the
+    bandwidth is never written here, and +inf is the correct "unreachable"
+    answer for it.
     """
     b = cuda.blockIdx.y
     t = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
@@ -116,7 +120,10 @@ def dtw_forward_diag_stream_sqeuclid_cuda(X, Y, prev2, prev1, curr, bandwidth, N
             v = prev1[b, i]
             if v < m: m = v
 
-    curr[b, i] = cost + m
+    result = cost + m
+    curr[b, i] = result
+    if i == LX[b] - 1 and j == LY[b] - 1:
+        out[b] = result
 
 
 @cuda.jit
