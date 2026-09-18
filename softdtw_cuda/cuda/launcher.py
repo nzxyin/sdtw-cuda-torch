@@ -192,7 +192,13 @@ def softdtw_forward_cuda_fused_sqeuclid(
     return out, R
 
 
-def dtw_forward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, bandwidth: float):
+def dtw_forward_cuda_fused_sqeuclid(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    bandwidth: float,
+    lens_x: torch.Tensor | None = None,
+    lens_y: torch.Tensor | None = None,
+):
     """Fused *hard* DTW forward for squared-euclidean distance (no D materialized).
 
     Exact DTW (gamma->0 limit of soft-DTW): same anti-diagonal wavefront and
@@ -202,7 +208,8 @@ def dtw_forward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, bandwidth:
     (B, N, M) local-cost tensor nor a full (B, N, M) DP table is materialized.
     Forward-only.
 
-    X: (B,N,D), Y: (B,M,D) CUDA tensors. Returns: out (B,) hard-DTW distances.
+    X: (B,N,D), Y: (B,M,D) CUDA tensors. lens_x/lens_y: optional (B,) int
+    tensors of per-sample true lengths. Returns: out (B,) hard-DTW distances.
     """
     if not (X.is_cuda and Y.is_cuda):
         raise ValueError("Expected CUDA tensors X and Y")
@@ -217,20 +224,36 @@ def dtw_forward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, bandwidth:
     B, N, D = X_.shape
     M = Y_.shape[1]
 
+    LX = _resolve_lens(lens_x, B, N, X_.device, "lens_x")
+    LY = _resolve_lens(lens_y, B, M, X_.device, "lens_y")
+
     # DTW is symmetric; keep the buffer axis on the shorter sequence so peak
-    # memory is O(B * min(N, M)).
+    # memory is O(B * min(N, M)). The swap decision stays whole-batch (on the
+    # padded dims), not per-sample -- LX/LY just swap along with X/Y so they
+    # keep naming the lengths of whichever tensor is now "X".
     if N > M:
         X_, Y_ = Y_, X_
         N, M = M, N
+        LX, LY = LY, LX
 
     X_ca = cuda.as_cuda_array(X_)
     Y_ca = cuda.as_cuda_array(Y_)
+    LX_ca = cuda.as_cuda_array(LX)
+    LY_ca = cuda.as_cuda_array(LY)
 
     # Three rotating anti-diagonals of length N (= min): prev2, prev1, curr.
     # +inf init; the (0,0) corner is seeded with 0 inside the kernel.
     bufs = [torch.full((B, N), math.inf, device=X_.device, dtype=X_.dtype)
             for _ in range(3)]
     a, b_, c = 0, 1, 2   # indices of prev2, prev1, curr
+
+    # Each rotating buffer slot is reused every 3 diagonals, so a short
+    # sample's terminal cell can't be read back from the buffers after the
+    # sweep moves on -- the kernel captures it into `out` the instant it's
+    # computed. +inf here is the correct answer for a terminal cell the
+    # bandwidth prunes (never written).
+    out = torch.full((B,), math.inf, device=X_.device, dtype=X_.dtype)
+    out_ca = cuda.as_cuda_array(out)
 
     inv_bw = float(bandwidth)  # can be -1.0 to disable
 
@@ -245,26 +268,39 @@ def dtw_forward_cuda_fused_sqeuclid(X: torch.Tensor, Y: torch.Tensor, bandwidth:
             cuda.as_cuda_array(bufs[a]),
             cuda.as_cuda_array(bufs[b_]),
             cuda.as_cuda_array(bufs[c]),
-            inv_bw, N, M, D, p,
+            inv_bw, N, M, LX_ca, LY_ca, out_ca, D, p,
         )
         a, b_, c = b_, c, a   # rotate: prev2<-prev1, prev1<-curr, curr<-old prev2
 
-    # After the final rotation the just-written last diagonal is in bufs[b_];
-    # the end cell (N-1, M-1) sits at index i = N-1.
-    return bufs[b_][:, N - 1].contiguous()
+    return out.contiguous()
 
 
-def dtw_forward_cuda(D: torch.Tensor, bandwidth: float):
+def dtw_forward_cuda(
+    D: torch.Tensor,
+    bandwidth: float,
+    lens_x: torch.Tensor | None = None,
+    lens_y: torch.Tensor | None = None,
+):
     """D-based *hard* DTW forward (min recurrence, no gamma). Forward-only.
 
-    D: (B,N,M) CUDA tensor of local costs. Returns: out (B,) hard-DTW distances.
+    D: (B,N,M) CUDA tensor of local costs. lens_x/lens_y: optional (B,) int
+    tensors of per-sample true lengths. Returns: out (B,) hard-DTW distances.
     Uses the general tiled anti-diagonal path (valid for all N,M).
+
+    No kernel-level per-sample restriction is needed: R is a full (B,N+2,M+2)
+    table where each cell is written exactly once and the DP recurrence only
+    ever reads strictly-smaller-index predecessors, so a sample's terminal
+    cell R[b, LX[b], LY[b]] is computed purely from real (non-padding) D
+    values regardless of what the sweep also computes outside that region.
     """
     if not D.is_cuda:
         raise ValueError("Expected CUDA tensor D")
 
     D_ = D.detach().contiguous()
     B, N, M = D_.shape
+
+    LX = _resolve_lens(lens_x, B, N, D_.device, "lens_x")
+    LY = _resolve_lens(lens_y, B, M, D_.device, "lens_y")
 
     R = torch.full((B, N + 2, M + 2), math.inf, device=D_.device, dtype=D_.dtype)
     R[:, 0, 0] = 0.0
@@ -283,7 +319,7 @@ def dtw_forward_cuda(D: torch.Tensor, bandwidth: float):
             D_ca, R_ca, float(bandwidth), N, M, p,
         )
 
-    return R[:, -2, -2].contiguous()
+    return _per_sample_out(R, LX, LY)
 
 
 def softdtw_backward_cuda_fused_sqeuclid(
@@ -670,9 +706,22 @@ def _dtw_forward_cpu_np(D: np.ndarray, bandwidth: float):
     return R
 
 
-def dtw_forward_cpu(D: torch.Tensor, bandwidth: float):
-    """Exact hard-DTW forward on CPU (D: (B,N,M) local costs) -> out (B,)."""
+def dtw_forward_cpu(
+    D: torch.Tensor,
+    bandwidth: float,
+    lens_x: torch.Tensor | None = None,
+    lens_y: torch.Tensor | None = None,
+):
+    """Exact hard-DTW forward on CPU (D: (B,N,M) local costs) -> out (B,).
+
+    Same reasoning as dtw_forward_cuda for why no per-sample restriction is
+    needed inside _dtw_forward_cpu_np itself: R[b, LX[b], LY[b]] depends only
+    on real (non-padding) D values.
+    """
+    B, N, M = D.shape
+    LX = _resolve_lens(lens_x, B, N, D.device, "lens_x")
+    LY = _resolve_lens(lens_y, B, M, D.device, "lens_y")
     D_np = D.detach().cpu().numpy()
     R_np = _dtw_forward_cpu_np(D_np, float(bandwidth))
     R = torch.from_numpy(R_np).to(D.device).type_as(D)
-    return R[:, -2, -2].contiguous()
+    return _per_sample_out(R, LX, LY)

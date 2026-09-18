@@ -38,6 +38,12 @@ class DTW(nn.Module):
                        for large D (e.g. 1-NN-DTW on foundation features) prefer
                        fused=False for much better speed.
         bandwidth: Sakoe-Chiba band. None or <= 0 disables the constraint.
+
+    Variable-length batches: forward() accepts optional per-sample length
+    tensors lens_x/lens_y of shape (B,), with the same semantics as
+    :class:`SoftDTW`: sample b is treated as x[b, :lens_x[b]] vs
+    y[b, :lens_y[b]], and padding frames beyond those lengths never enter
+    the alignment.
     """
 
     def __init__(self, dist: str = "sqeuclidean", fused: bool | None = None,
@@ -59,7 +65,13 @@ class DTW(nn.Module):
         return fused_ok
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        lens_x: torch.Tensor | None = None,
+        lens_y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Accept (N,D) and (M,D)
         if x.dim() == 2:
             x = x.unsqueeze(0)
@@ -78,15 +90,16 @@ class DTW(nn.Module):
             raise ValueError(f"Sequence lengths must be > 0. Got N={x.shape[1]}, M={y.shape[1]}.")
 
         if self._use_fused(x, y):
-            return dtw_forward_cuda_fused_sqeuclid(x, y, self.bandwidth)
+            return dtw_forward_cuda_fused_sqeuclid(x, y, self.bandwidth, lens_x, lens_y)
 
         D_xy = pairwise_distance(x, y, dist=self.dist)
         if D_xy.is_cuda:
-            return dtw_forward_cuda(D_xy, self.bandwidth)
-        return dtw_forward_cpu(D_xy, self.bandwidth)
+            return dtw_forward_cuda(D_xy, self.bandwidth, lens_x, lens_y)
+        return dtw_forward_cpu(D_xy, self.bandwidth, lens_x, lens_y)
 
 
 def dtw(x: torch.Tensor, y: torch.Tensor, dist: str = "sqeuclidean",
-            fused: bool | None = None, bandwidth: float | None = None) -> torch.Tensor:
+            fused: bool | None = None, bandwidth: float | None = None,
+            lens_x: torch.Tensor | None = None, lens_y: torch.Tensor | None = None) -> torch.Tensor:
     """Functional exact hard-DTW distance. See :class:`DTW`."""
-    return DTW(dist=dist, fused=fused, bandwidth=bandwidth)(x, y)
+    return DTW(dist=dist, fused=fused, bandwidth=bandwidth)(x, y, lens_x=lens_x, lens_y=lens_y)

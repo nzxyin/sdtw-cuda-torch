@@ -252,6 +252,10 @@ cost = dtw(x, y, dist="sqeuclidean")  # functional alias
   high-dimensional features** (e.g. foundation-model embeddings, `D` in the hundreds), use
   `fused=False`: the cost-matrix path is far faster than fused's per-cell `O(D)` loop, and
   chunk the candidate pairs to bound the `(pairs, N, M)` cost tensor.
+* Also supports per-sample `lens_x`/`lens_y` (see
+  [Variable-Length Sequences](#variable-length-batches-padding-support) below), in every mode
+  (fused / unfused, CUDA / CPU). Since `DTW` has no backward pass, only the forward distance is
+  affected: padding frames never enter the alignment.
 
 ---
 
@@ -259,8 +263,9 @@ cost = dtw(x, y, dist="sqeuclidean")  # functional alias
 
 Real batches rarely share one sequence length. Pass per-sample lengths and
 padding frames never enter the alignment: the DP recurrence stops at each
-sample's own true length, per-sample results are read from each sample's own
-final DP cell, and **padding frames receive exactly-zero gradients**:
+sample's own true length, and per-sample results are read from each sample's
+own final DP cell. Both `SoftDTW` and `DTW` accept `lens_x`/`lens_y`; for
+`SoftDTW`, **padding frames also receive exactly-zero gradients**:
 
 ```python
 loss_fn = SoftDTW(gamma=1.0)
@@ -272,13 +277,17 @@ lens_y = torch.tensor([...])  # (B,) true lengths, 1 <= lens_y[b] <= M
 
 loss = loss_fn(x, y, lens_x=lens_x, lens_y=lens_y).mean()
 loss.backward()
+
+# DTW is forward-only (no backward pass), same lens_x/lens_y:
+cost = DTW(dist="sqeuclidean")(x, y, lens_x=lens_x, lens_y=lens_y)
 ```
 
-* Works in every mode: fused / unfused, CUDA / CPU, `normalize=True` / `False`
+* Works in every mode: fused / unfused, CUDA / CPU; for `SoftDTW`, also
+  `normalize=True` / `False`
 * Equivalent to (but much faster than) a Python loop of per-sample sliced
   batch-1 calls; batch parallelism is preserved on the GPU
-* With `normalize=True`, the padded dims must still match (`N == M`), but
-  per-sample `lens_x[b]`/`lens_y[b]` may differ
+* With `SoftDTW(normalize=True)`, the padded dims must still match (`N == M`),
+  but per-sample `lens_x[b]`/`lens_y[b]` may differ
 * Omitting the lengths keeps the classic fixed-length behavior
 
 ---
@@ -433,6 +442,7 @@ pytest -v
 | `test_cuda_bandwidth_regression.py` | Regression: finite gradients under a Sakoe–Chiba bandwidth |
 | `test_validation.py` | Input validation: gamma, device, empty sequences, shape mismatches |
 | `test_lengths.py` | Variable-length padded batches (`lens_x`/`lens_y`): batched-vs-per-sample equivalence, exact-zero padding gradients, tiled-path lengths, gradcheck |
+| `test_dtw_lengths.py` | Variable-length padded batches on the exact-DTW path: batched-vs-per-sample equivalence, `N>M` buffer swap with unequal lengths, fused/unfused/CPU agreement, long sequences |
 
 ---
 
